@@ -19,7 +19,8 @@ import os
 import argparse
 
 # ─── 默认配置 ───
-SERVER_IP   = "172.20.10.2"
+# SERVER_IP   = "172.20.10.2"
+SERVER_IP   = "192.168.65.130"
 SERVER_PORT = 6666
 DATA_DIR    = "data"
 

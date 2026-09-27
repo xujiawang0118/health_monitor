@@ -182,6 +182,119 @@ static void on_mqtt_disconnect(struct mosquitto *mosq, void *obj, int rc)
 }
 
 
+/* 创建并发起一次连接（云端模式下每次重连都重建，因 ClientID 含时间戳）。
+ * 成功返回 mosquitto 句柄，失败返回 NULL（内部已销毁）。 */
+static struct mosquitto *mqtt_client_new_and_connect(void)
+{
+    struct mosquitto *mosq;
+    int rc;
+
+#ifdef MQTT_CLOUD_MODE
+    /* 云端模式：构建 ClientID + 计算 Password */
+    char timestamp[11];  /* "YYYYMMDDHH" + '\0' */
+    get_huawei_timestamp(timestamp, sizeof(timestamp));
+
+    /* 拼接 ClientID */
+    char client_id_str[128];
+    build_huawei_client_id(client_id_str, sizeof(client_id_str), timestamp);
+
+    /* 计算 Password：HMAC-SHA256(key=时间戳, data=DeviceSecret) */
+    char password[65];
+    rc = compute_huawei_password(MQTT_CLOUD_DEVICE_SECRET, timestamp,
+                                  password, sizeof(password));
+    if (rc != 0) {
+        tcp_log("[MQTT] Password 计算失败 (rc=%d)", rc);
+        return NULL;
+    }
+
+    /* 拼接 Username（= ProductKey_DeviceName） */
+    char username[128];
+    snprintf(username, sizeof(username), "%s_%s",
+             MQTT_CLOUD_PRODUCT_KEY, MQTT_CLOUD_DEVICE_NAME);
+
+    /* 创建客户端（cloud mode 下 ClientID 按华为云格式） */
+    mosq = mosquitto_new(client_id_str, true, NULL);
+    if(mosq == NULL) {
+        tcp_log("[MQTT] 客户端创建失败");
+        return NULL;
+    }
+
+    tcp_log("[MQTT] 云端模式 | broker: %s:%d",
+            MQTT_CLOUD_BROKER, MQTT_CLOUD_PORT);
+    tcp_log("[MQTT] DeviceId: %s", username);
+
+
+    /* 注册回调（本地/云端共用） */
+    mosquitto_connect_callback_set(mosq, on_mqtt_connect);
+    mosquitto_disconnect_callback_set(mosq, on_mqtt_disconnect);
+
+    /* 设置遗嘱消息（本地/云端共用） */
+    mosquitto_will_set(mosq, MQTT_TOPIC_STATUS,(int)strlen("offline"), "offline", 0, true);
+
+
+    /*
+     * TLS 配置 — 仅在云端模式启用。
+     *
+     * mosquitto_tls_set() 参数：
+     *   cafile   — CA 证书文件路径（用于验证服务器证书）
+     *   capath   — CA 证书目录（与 cafile 二选一即可）
+     *   certfile — 客户端证书（华为云 IoT 不需要双向认证，传 NULL）
+     *   keyfile  — 客户端私钥（同上）
+     *   pw_cb    — 私钥密码回调（同上，传 NULL）
+     *
+     * 设置 TLS 后，mosquitto_connect() 内部自动升级为 MQTTS。
+     */
+    rc = mosquitto_tls_set(mosq, MQTT_TLS_CAFILE, NULL, NULL, NULL, NULL);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        tcp_log("[MQTT] TLS 配置失败: %s", mosquitto_strerror(rc));
+        tcp_log("[MQTT] 请确认 CA 证书文件存在: %s", MQTT_TLS_CAFILE);
+        tcp_log("[MQTT] 安装: sudo apt install ca-certificates");
+        mosquitto_destroy(mosq);
+        return NULL;
+    }
+
+    /* 设置用户名和密码（华为云鉴权） */
+    rc = mosquitto_username_pw_set(mosq, username, password);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        tcp_log("[MQTT] 用户名/密码设置失败: %s", mosquitto_strerror(rc));
+        mosquitto_destroy(mosq);
+        return NULL;
+    }
+    tcp_log("[MQTT] 云端模式 | DeviceId: %s | 时间戳: %s", username, timestamp);
+    rc = mosquitto_connect(mosq, MQTT_CLOUD_BROKER, MQTT_CLOUD_PORT, 60);
+
+#else
+    /* 本地模式：直接连接 */
+    mosq = mosquitto_new("health_monitor_i.MX6ULL", true, NULL);
+    if (mosq == NULL) {
+        tcp_log("[MQTT] 客户端创建失败");
+        return NULL;
+    }
+
+     /* 注册回调（本地/云端共用） */
+    mosquitto_connect_callback_set(mosq, on_mqtt_connect);
+    mosquitto_disconnect_callback_set(mosq, on_mqtt_disconnect);
+
+    /* 设置遗嘱消息（本地/云端共用） */
+    mosquitto_will_set(mosq, MQTT_TOPIC_STATUS,(int)strlen("offline"), "offline", 0, true);
+
+    rc = mosquitto_connect(mosq, MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60);
+#endif
+
+    if (rc != MOSQ_ERR_SUCCESS) {
+        tcp_log("[MQTT] 连接请求失败: %s", mosquitto_strerror(rc));
+        mosquitto_destroy(mosq);
+        return NULL;
+    }
+    return mosq;
+    
+
+}
+
+
+
+
+
 /* ═══════════════════════════════════════════════════════════════════
  *  MQTT 客户端线程
  *
@@ -215,7 +328,7 @@ void *thread_mqtt(void *arg)
     (void)arg;
 
     int rc;
-    uint64_t last_publish = 0;
+
 
     /* 初始化 libmosquitto 全局状态（所有线程只调用一次） */
     rc = mosquitto_lib_init();
@@ -224,110 +337,9 @@ void *thread_mqtt(void *arg)
         return NULL;
     }
 
-#ifdef MQTT_CLOUD_MODE
-    /* ──────────── 云端模式：准备鉴权参数 ──────────── */
-
-    char timestamp[11];  /* "YYYYMMDDHH" + '\0' */
-    get_huawei_timestamp(timestamp, sizeof(timestamp));
-
-    /* 拼接 ClientID */
-    char client_id_str[128];
-    build_huawei_client_id(client_id_str, sizeof(client_id_str), timestamp);
-
-    /* 计算 Password：HMAC-SHA256(key=时间戳, data=DeviceSecret) */
-    char password[65];
-    rc = compute_huawei_password(MQTT_CLOUD_DEVICE_SECRET, timestamp,
-                                  password, sizeof(password));
-    if (rc != 0) {
-        tcp_log("[MQTT] Password 计算失败 (rc=%d)", rc);
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-
-    /* 拼接 Username（= ProductKey_DeviceName） */
-    char username[128];
-    snprintf(username, sizeof(username), "%s_%s",
-             MQTT_CLOUD_PRODUCT_KEY, MQTT_CLOUD_DEVICE_NAME);
-
-    /* 创建客户端（cloud mode 下 ClientID 按华为云格式） */
-    struct mosquitto *mosq = mosquitto_new(client_id_str, true, NULL);
-
-    tcp_log("[MQTT] 云端模式 | broker: %s:%d",
-            MQTT_CLOUD_BROKER, MQTT_CLOUD_PORT);
-    tcp_log("[MQTT] DeviceId: %s", username);
-#else
-    /* ──────────── 本地模式：直接连接 ──────────── */
-
-    struct mosquitto *mosq = mosquitto_new("health_monitor_i.MX6ULL", true, NULL);
-#endif
-
-    if (mosq == NULL) {
-        tcp_log("[MQTT] 客户端创建失败");
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-
-    /* 注册回调（本地/云端共用） */
-    mosquitto_connect_callback_set(mosq, on_mqtt_connect);
-    mosquitto_disconnect_callback_set(mosq, on_mqtt_disconnect);
-
-    /* 设置遗嘱消息（本地/云端共用） */
-    mosquitto_will_set(mosq, MQTT_TOPIC_STATUS,
-                       (int)strlen("offline"), "offline", 0, true);
-
-#ifdef MQTT_CLOUD_MODE
-    /*
-     * TLS 配置 — 仅在云端模式启用。
-     *
-     * mosquitto_tls_set() 参数：
-     *   cafile   — CA 证书文件路径（用于验证服务器证书）
-     *   capath   — CA 证书目录（与 cafile 二选一即可）
-     *   certfile — 客户端证书（华为云 IoT 不需要双向认证，传 NULL）
-     *   keyfile  — 客户端私钥（同上）
-     *   pw_cb    — 私钥密码回调（同上，传 NULL）
-     *
-     * 设置 TLS 后，mosquitto_connect() 内部自动升级为 MQTTS。
-     */
-    rc = mosquitto_tls_set(mosq, MQTT_TLS_CAFILE, NULL, NULL, NULL, NULL);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        tcp_log("[MQTT] TLS 配置失败: %s", mosquitto_strerror(rc));
-        tcp_log("[MQTT] 请确认 CA 证书文件存在: %s", MQTT_TLS_CAFILE);
-        tcp_log("[MQTT] 安装: sudo apt install ca-certificates");
-        mosquitto_destroy(mosq);
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-
-    /* 设置用户名和密码（华为云鉴权） */
-    rc = mosquitto_username_pw_set(mosq, username, password);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        tcp_log("[MQTT] 用户名/密码设置失败: %s", mosquitto_strerror(rc));
-        mosquitto_destroy(mosq);
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-
-    /* 连接云端 broker（TLS 8883 端口） */
-    rc = mosquitto_connect(mosq, MQTT_CLOUD_BROKER, MQTT_CLOUD_PORT, /* keepalive */ 60);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        tcp_log("[MQTT] 云端连接请求失败: %s", mosquitto_strerror(rc));
-        tcp_log("[MQTT] 请检查: 1)网络连通 2)三元组正确 3)板端时间准确");
-        mosquitto_destroy(mosq);
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-#else
-    /* 连接本地 broker（TCP 1883 端口） */
-    rc = mosquitto_connect(mosq, MQTT_BROKER_HOST, MQTT_BROKER_PORT,
-                           /* keepalive */ 60);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        tcp_log("[MQTT] 连接请求失败: %s", mosquitto_strerror(rc));
-        tcp_log("[MQTT] 请确认 broker 已启动: mosquitto -d");
-        mosquitto_destroy(mosq);
-        mosquitto_lib_cleanup();
-        return NULL;
-    }
-#endif
+    /* mosq 初始为 NULL，首轮循环里由 mqtt_client_new_and_connect() 创建。
+     * 云端模式 ClientID 含时间戳，重连时必须销毁重建，不能复用。 */
+    struct mosquitto *mosq = NULL;
 
     /*
      * 主循环：驱动 MQTT 网络 I/O + 定期发布传感器数据。
@@ -338,11 +350,44 @@ void *thread_mqtt(void *arg)
      *
      * mosquitto_loop 的超时保证 Ctrl+C 响应延迟 ≤ 100ms。
      */
+    uint64_t last_reconnect = 0;
+    uint64_t last_publish = 0;
+
+    /* 发布间隔：本地 2Hz 对齐 TCP 广播；云端降频以控制每日消息量 */
+#ifdef MQTT_CLOUD_MODE
+    const uint64_t publish_interval_ms = MQTT_CLOUD_PUBLISH_INTERVAL_MS;
+#else
+    const uint64_t publish_interval_ms = MQTT_PUBLISH_INTERVAL_MS;
+#endif
+
     while (g_running) {
-        mosquitto_loop(mosq, /* timeout_ms */ 100, /* max_packets */ 1);
+
+        if (mosq != NULL) {
+            mosquitto_loop(mosq, /* timeout_ms */ 100, /* max_packets */ 1);
+        } else {
+            /* mosq 为空（如断网导致重建失败）时也要休眠 100ms，避免忙等占满 CPU */
+            usleep(100 * 1000);
+        }
+
+        /* 未连接时，每 5 秒重试一次，而不是退出线程 */
+        if (!g_mqtt_connected) {
+            uint64_t now = get_sys_ms();
+            if (now - last_reconnect >= 5000) {
+                tcp_log("[MQTT] 尝试重新连接 broker...");
+                if (mosq != NULL) {
+                    mosquitto_destroy(mosq);     /* 销毁旧客户端（含旧 ClientID） */
+                    mosq = NULL;
+                }
+                mosq = mqtt_client_new_and_connect();
+                if (mosq == NULL) {
+                    tcp_log("[MQTT] 新客户端创建/连接失败，5 秒后重试");
+                }
+                last_reconnect = now;
+            }
+        }
 
         uint64_t now = get_sys_ms();
-        if (g_mqtt_connected && (now - last_publish >= MQTT_PUBLISH_INTERVAL_MS)) {
+        if (mosq != NULL && g_mqtt_connected && (now - last_publish >= publish_interval_ms)) {
             pthread_mutex_lock(&g_mpu_lock);
             mpu6050_data_t mpu = g_latest_mpu;
             pthread_mutex_unlock(&g_mpu_lock);
@@ -406,15 +451,19 @@ void *thread_mqtt(void *arg)
     }
 
     /* 清理：发布离线状态 → 断开连接 → 释放资源 */
-    if (g_mqtt_connected) {
-        mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS,
-                          (int)strlen("offline"), "offline",
-                          /* qos */ 0, /* retain */ true);
-        tcp_log("[MQTT] 已发布离线状态");
+    if(mosq != NULL) {
+
+        if (g_mqtt_connected) {
+            mosquitto_publish(mosq, NULL, MQTT_TOPIC_STATUS,
+                            (int)strlen("offline"), "offline",
+                            /* qos */ 0, /* retain */ true);
+            tcp_log("[MQTT] 已发布离线状态");
+        }
+
+        mosquitto_disconnect(mosq);
+        mosquitto_destroy(mosq);
     }
 
-    mosquitto_disconnect(mosq);
-    mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
     tcp_log("[MQTT] 线程已退出");
 

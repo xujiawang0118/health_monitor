@@ -9,6 +9,7 @@
 
 #include "http_server.h"
 #include "globals.h"
+#include "watchdog.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +20,17 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <microhttpd.h>
+
+/* libmicrohttpd 0.9.71 起，访问回调的返回类型从 int 改成了 enum MHD_Result。
+ * PC 端（1.0.x）有 MHD_Result；板端 Debian 10 是 0.9.62，只有 int。
+ * 用 MHD_VERSION 版本宏做兼容，让两边回调类型都能匹配 MHD_AccessHandlerCallback。
+ *   MHD_VERSION 编码：(major<<24)|(minor<<16)|(patch<<8)，0.9.71 == 0x00094700。
+ */
+#if MHD_VERSION >= 0x00094700
+typedef enum MHD_Result mhd_result_t;
+#else
+typedef int mhd_result_t;
+#endif
 
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -160,7 +172,7 @@ poll();
  *    可以直接返回响应。对于 POST 请求，MHD 会多次调用，
  *    每次传入一段请求体数据，直到消费完毕。
  * ═══════════════════════════════════════════════════════════════════ */
-static int http_handler(void *cls,
+static mhd_result_t http_handler(void *cls,
                         struct MHD_Connection *conn,
                         const char *url,
                         const char *method,
@@ -171,6 +183,7 @@ static int http_handler(void *cls,
 {
     (void)cls;
     (void)version;
+    (void)upload_data;   /* GET 路径不读请求体；有请求体时在下面 size 分支消费 */
 
     /*
      * 首次回调时记录新连接。
@@ -309,6 +322,7 @@ void *thread_http_server(void *arg)
      * 每 500ms 检查一次 g_running，收到退出信号后关闭 daemon。
      */
     while (g_running) {
+        wd_beat(WD_CH_HTTP);
         usleep(500000);  /* 500ms */
     }
 

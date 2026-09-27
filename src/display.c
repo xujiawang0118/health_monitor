@@ -12,6 +12,7 @@
 
 #include "display.h"
 #include "globals.h"
+#include "watchdog.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -95,6 +96,8 @@ void *thread_display(void *arg)
 {
     (void)arg;
     while (g_running) {
+        wd_beat(WD_CH_DISPLAY);
+
         usleep(DISPLAY_INTERVAL_MS * 1000);
 
         pthread_mutex_lock(&g_ppg_lock);

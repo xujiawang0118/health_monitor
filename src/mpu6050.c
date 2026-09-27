@@ -48,6 +48,7 @@
 
 #include <stdio.h>        /* fprintf, stderr */
 #include <unistd.h>       /* usleep */
+#include <errno.h>        /* errno：失败时透传给调用方 */
 #include "i2c_utils.h"
 #include "mpu6050.h"
 
@@ -152,7 +153,16 @@ int mpu6050_read_raw(int fd, uint8_t dev_addr, mpu6050_raw_data_t *raw)
     uint8_t buf[14];
     int ret = i2c_read_reg(fd, dev_addr, MPU6050_REG_ACCEL_XOUT_H, buf, 14);
     if (ret < 0) {
+        /*
+         * 调用方（thread_mpu6050）要靠 errno 区分两类失效：
+         *   errno == EAGAIN(11) → i2c-imx 报仲裁丢失，总线级故障
+         *   其它                → 事务级 NACK/超时
+         * 而 perror 内部会调 fprintf，有可能改写 errno。所以先存后还原，
+         * 保证调用方拿到的是 i2c_read_reg 失败那一刻的真实 errno。
+         */
+        int saved_errno = errno;
         perror("mpu6050_read_raw: 读取原始数据失败");
+        errno = saved_errno;
         return -1;
     }
 
@@ -172,6 +182,42 @@ int mpu6050_read_raw(int fd, uint8_t dev_addr, mpu6050_raw_data_t *raw)
     raw->gyro_z  = (int16_t)((buf[12] << 8) | buf[13]);
 
     return 0;
+}
+
+int mpu6050_raw_all_zero(const mpu6050_raw_data_t *raw)
+{
+    if (raw == NULL) {
+        return 1;   /* 空指针按无效处理 */
+    }
+
+    /*
+     * 7 个字段全为 0 才算"全 0"。
+     * 正常静止时 accel_z ≈ 16384（1g）、temp ≈ -16000，不可能全 0；
+     * 即使个别轴凑巧为 0，七个同时为 0 的概率也趋近于 0。
+     */
+    return (raw->accel_x == 0 && raw->accel_y == 0 && raw->accel_z == 0 &&
+            raw->temp    == 0 &&
+            raw->gyro_x  == 0 && raw->gyro_y  == 0 && raw->gyro_z  == 0);
+}
+
+int mpu6050_reset(int fd, uint8_t dev_addr)
+{
+    int ret;
+
+    /*
+     * PWR_MGMT1 bit7 = H_RESET，写 1 触发全寄存器复位，芯片随后自动清 0。
+     * 这是软件层最轻量的恢复手段，不需要动硬件复位引脚。
+     */
+    ret = i2c_write_byte(fd, dev_addr, MPU6050_REG_PWR_MGMT1, 0x80);
+    if (ret < 0) {
+        fprintf(stderr, "mpu6050_reset: 写 H_RESET 失败\n");
+        return -1;
+    }
+
+    /* 复位后芯片内部振荡器需要重新起振，留足稳定时间再初始化 */
+    usleep(100000);  /* 100ms */
+
+    return mpu6050_init(fd, dev_addr);
 }
 
 void mpu6050_convert(const mpu6050_raw_data_t *raw, mpu6050_data_t *data,

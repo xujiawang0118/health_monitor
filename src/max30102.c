@@ -29,7 +29,7 @@
  *   R = (AC_red / DC_red) / (AC_ir / DC_ir)
  * 通过经验公式 R → SpO2。
  */
-
+#include "config.h"
 #include "max30102.h"
 #include "i2c_utils.h"
 #include <stdio.h>
@@ -52,9 +52,10 @@
  *
  *   这与 ppg_get_fill_count() 封装 buf_fill_count 是同样的模式。
  */
+#ifndef SENSOR_MOCK
 static struct gpiod_chip *int_chip = NULL;
 static struct gpiod_line *int_line = NULL;
-
+#endif
 /* ─── 全局状态（单线程安全） ─── */
 
 /* 滑动窗口缓存（环形缓冲），用于计算 DC 基线 */
@@ -218,7 +219,7 @@ int max30102_init(int fd, uint8_t dev_addr)
     return 0;
 }
 
-
+#ifndef SENSOR_MOCK
 /**
  * @brief 初始化 MAX30102 中断引脚（GPIO 输入，双边沿检测）
  *
@@ -315,6 +316,7 @@ int max30102_int_read_event(void)
     return 0;
 }
 
+
 /**
  * @brief 释放 MAX30102 中断引脚资源
  *
@@ -331,6 +333,26 @@ void max30102_int_cleanup(void)
         int_chip = NULL;
     }
 }
+
+
+#else /* SENSOR_MOCK：无硬件，提供桩函数 */
+int max30102_int_init(void)
+{
+    /* mock 模式无 GPIO 硬件，返回无效 fd，main.c 不会 poll 它 */
+    return -1;
+}
+
+int max30102_int_read_event(void)
+{
+    return -1;
+}
+
+void max30102_int_cleanup(void)
+{
+    /* 无资源需要释放 */
+}
+
+#endif /* SENSOR_MOCK */
 
 
 /**
@@ -677,3 +699,5 @@ int ppg_get_fill_count(void)
 {
     return (int)buf_fill_count;
 }
+
+

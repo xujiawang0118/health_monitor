@@ -137,6 +137,35 @@ int mpu6050_init(int fd, uint8_t dev_addr);
 int mpu6050_read_raw(int fd, uint8_t dev_addr, mpu6050_raw_data_t *raw);
 
 /**
+ * @brief 判断一组原始数据是否全为 0
+ *
+ * 全 0 是典型的"假成功"数据：总线毛刺把器件内部状态打坏后，读事务
+ * 仍能完成（ioctl 返回成功），但读回的 14 字节全是 0。正常静止时
+ * 加速度 Z 轴约 +16384（1g）、温度约 -16000 LSB，绝不可能全 0。
+ * 所以"全 0"可以当作数据无效的可靠判据，供上层触发器件复位。
+ *
+ * @param raw   要检查的原始数据
+ * @return int  1 = 全 0（无效），0 = 含有效数据
+ */
+int mpu6050_raw_all_zero(const mpu6050_raw_data_t *raw);
+
+/**
+ * @brief 复位并重新初始化 MPU6050
+ *
+ * 通过写 PWR_MGMT1 的 bit7（H_RESET = 0x80）触发芯片软复位，
+ * 等待内部振荡器稳定后重新走一遍 mpu6050_init。
+ *
+ * 注意：这只对"器件状态被打坏但 I2C 事务能完成"的情况有效。
+ * 如果总线被从机拉死（SDA 卡低、ioctl 阻塞），这里面的写操作
+ * 同样会阻塞，需要总线恢复（GPIO 拉 SCL）才能救，见 i2c_utils.c 头注释。
+ *
+ * @param fd        I2C 文件描述符
+ * @param dev_addr  MPU6050 的 I2C 地址
+ * @return int      成功返回 0，失败返回 -1
+ */
+int mpu6050_reset(int fd, uint8_t dev_addr);
+
+/**
  * @brief 将原始数据转换为物理量
  *
  * 为什么分两步（read_raw → convert）而不是直接在驱动里转换：
