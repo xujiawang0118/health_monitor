@@ -7,13 +7,16 @@
 #   chmod +x scripts/check_i2c.sh
 #   sudo ./scripts/check_i2c.sh [总线编号]
 #
-# 默认检查 I2C-1，也可以指定其他总线：
-#   sudo ./scripts/check_i2c.sh 0
+# 默认检查 i2c-0（本项目的传感器总线），也可以指定其他总线：
+#   sudo ./scripts/check_i2c.sh 1
+#
+# 注意命名陷阱：设备树里这条总线叫 &i2c1（0x021a0000），但 Linux 里它是
+# /dev/i2c-0，错位一个。所以这里默认值是 0，不是 1。
 # ============================================================
 
 set -e  # 任何命令失败则退出
 
-BUS_NUM="${1:-1}"             # 默认 I2C-1
+BUS_NUM="${1:-0}"             # 默认 i2c-0
 I2C_DEV="/dev/i2c-${BUS_NUM}"
 
 echo "=========================================="
@@ -59,9 +62,13 @@ echo ""
 i2cdetect -y "${BUS_NUM}"
 echo ""
 echo "  期望看到的设备地址："
+echo "    0x14 → GT1151（板载电容触摸屏，也是 i2c-0 仲裁丢失的重点嫌疑）"
 echo "    0x57 → MAX30102（心率血氧）"
 echo "    0x68 → MPU6050（六轴传感器）"
 echo "    0x69 → MPU6050（如果 AD0 接了 VCC）"
+echo ""
+echo "  若 0x57/0x68 突然全部消失、且 dmesg 里有 I2C 报错，"
+echo "  多半是总线被从机拉死（仲裁丢失），见 docs/i2c-bus-recovery.md"
 echo ""
 
 # ─── 4. 检查内核驱动日志 ───

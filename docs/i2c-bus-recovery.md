@@ -4,6 +4,9 @@
 > 内核：4.19.35-imx6（野火 ebf_linux_kernel）
 > 涉及项目：health_monitor
 > 时间：2026-09 中下旬
+>
+> **结果**：设备树补丁已部署，现象不再复现；证据强度与"尚未直接证实的部分"
+> 在[第 7 节](#7-验证方法与证据强度)里分开写清楚了。
 
 ---
 
@@ -482,7 +485,7 @@ sudo dmesg | grep -iE "recovery|scl,sda"
 
 ---
 
-## 7. 验证方法与当前状态
+## 7. 验证方法与证据强度
 
 ### 已确认（设备树层面）
 
@@ -500,20 +503,46 @@ ls /proc/device-tree/soc/aips-bus@2100000/i2c@21a0000/ | grep gpios
 
 同时说明 overlay `imx-fire-i2c1.dtbo` **确认未被加载**（否则 `pinctrl-names` 只剩 `default`）。
 
-### 仍未确认（驱动层面）
+### 长跑结果（2026-09 结项）
 
-**`pinctrl_lookup_state(dev, "gpio")` 是否真的成功。**
-设备树里有属性 ≠ 驱动用上了。决定性证据是坑 4 里那段 dyndbg 输出。
+补丁部署后长期运行，**i2c-0 未再出现仲裁丢失**，此前"跑几分钟就报废"的现象消失。
+配合应用层的看门狗兜底与 systemd 自启动，这一层已经可以作为生产形态放着跑。
 
-### 长跑观察
+### 但仍要说清楚：这**不等于**证明了恢复通路被执行过
 
-跑过 1 小时无瘫痪。但按坑 4 的道理，**这不算证明**。
+按坑 4 的道理，"不瘫痪 + 没有日志"存在两种同样成立的解释：
 
-### 判据
+1. 总线确实进过 IAL，恢复通路把它救回来了（补丁生效）；
+2. 这段时间总线压根没进过 IAL（补丁是否生效无从体现）。
 
-- 好：1 小时 + 真实复现场景（触摸屏有人操作）不瘫痪
-- 更好：开 dyndbg 跑到复现，dmesg 里能看到恢复成功
-- 最硬：`dmesg` 里检索到 `SCL is stuck low` 之外的恢复记录
+两者在默认日志级别下**长得一模一样** —— 恢复成功路径上全是 `dev_dbg`，
+只有恢复**失败**才打 `dev_err`。所以目前的证据强度是
+"补丁在设备树层面确实配上了（`pinctrl-names` 输出两个字符串）+ 现象不再复现"，
+而不是"我亲眼看见它恢复了一次"。
+
+### 要拿铁证，就开 dyndbg 抓一次
+
+想在简历/面试里说"验证过恢复通路"，用这段拿到 dmesg 实据：
+
+```bash
+# 打开 i2c-imx.c 的动态调试（默认关，这就是"没日志"的原因）
+echo -n "file i2c-imx.c +p" | sudo tee /sys/kernel/debug/dynamic_debug/control
+
+sudo dmesg -C
+# 重新绑定控制器，逼它重跑一次 probe
+echo 21a0000.i2c | sudo tee /sys/bus/platform/drivers/imx-i2c/unbind
+echo 21a0000.i2c | sudo tee /sys/bus/platform/drivers/imx-i2c/bind
+sudo dmesg | grep -iE "recovery|scl,sda"
+```
+
+- 看到 `using scl,sda for recovery` → **`pinctrl_lookup_state(dev,"gpio")` 成功**，
+  三个必要条件全满足，恢复通路确实接通了
+- 看到 `recovery information incomplete` → 还差条件，回坑 4 排查
+- 之后保持 dyndbg 开着长跑，真触发恢复时 dmesg 里会留痕
+
+> 注意：这段**只是证明 probe 阶段拿到了恢复信息**，不等于证明
+> `i2c_generic_scl_recovery()` 真的执行过。后者只能在真实复现时从 dmesg 里抓。
+> 讲的时候别把这两件事混成一件。
 
 ---
 
@@ -540,6 +569,20 @@ echo w | sudo tee /proc/sysrq-trigger; sudo dmesg | tail -150
 次要嫌疑：本版 4.19 的 `i2c_imx_xfer()` 每次传输都做一对
 `pm_runtime_enable/disable`（上游后来挪到 probe 了），`pm_runtime_disable()` 内部有 barrier。
 
+### 本阶段的处理：暂避，不再纠缠
+
+这条线**没有解决，只是被绕过了**，要说清楚：
+
+- 它的触发条件始终没定位，而且已经和 I2C 脱钩（总线不瘫痪时照样复现）；
+- 继续卡在这里的性价比很低 —— 要定位就必须**在现场复现的当下**抓到内核栈，
+  这是碰运气的事；
+- 而它带来的实际危害（进程退不掉、只能拔电）已经被看门狗 + systemd 覆盖了：
+  进程卡住 → 约 50 秒后整板复位 → systemd 自动拉起。
+
+所以本阶段的选择是**记录下来、留好取证手段、继续往前走**。
+这不是"忽略问题"，是把一个低概率、影响可控、取证依赖运气的问题
+排在已知收益更高的稳定性工作之后 —— 面试里这样讲，比含糊过去要站得住。
+
 ---
 
 ## 9. 后续工程响应：看门狗兜底
@@ -549,17 +592,20 @@ echo w | sudo tee /proc/sysrq-trigger; sudo dmesg | tail -150
 
 - 监视 5 路心跳（max30102 / mpu6050 / display / tcp / http），
   **故意排除 mqtt** —— `mosquitto_connect()` 阻塞几十秒是正常重连，
-  算进去会让网络抖动变成整板重启
+  算进去会让网络抖动变成整板重启（后来断网重连的实测印证了这个决策）
 - 阈值 20 秒停滞 → 停止喂狗 → 30 秒后 `imx2_wdt` 复位整板
 - 跨重启记账：`unclean_boots`（靠自己写 `last_clean` 标记，不依赖硬件）
   + `wd_resets`（靠 `WDIOC_GETBOOTSTATUS`）
+- 与 systemd 配合：`Restart=always` 保证复位后自动拉起；
+  `StartLimitBurst` 防启动循环（I2C 一上来就卡 → 复位 → 又卡）
 
 **要连起来看的一点**：如果以后给 I2C 访问加指数退避，
 退避导致的线程停滞**不能超过看门狗阈值**，否则总线抖一下就把板子喂重启了。
 两处必须一起设计。
 
 （看门狗自身的实现要点、`imx2_wdt` 的三条反直觉事实，见
-`docs/` 之外的记忆文件和 `include/watchdog.h` 注释。）
+`include/watchdog.h` 与 `src/watchdog.c` 的注释，以及 `PROJECT_GUIDE.md`
+的"长时间运行保障"一节。）
 
 ---
 

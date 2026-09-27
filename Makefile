@@ -35,11 +35,19 @@ LDFLAGS_CROSS := -lpthread -lm -lmicrohttpd -lmosquitto -lssl -lcrypto -lgpiod -
 #   -fsanitize=address      内存错误检测（越界/use-after-free/泄漏）
 #   -fno-omit-frame-pointer 保留栈帧指针，报错时能定位到具体函数
 #   -O0                     关闭优化，报错行号准确
+# EXTRA_CFLAGS：命令行追加的编译宏，用法 make EXTRA_CFLAGS=-DSENSOR_MOCK
+# 必须显式拼进 CFLAGS —— 它是 make 的命令行变量，不会自动传给编译器，
+# 漏掉这一项的表现是"加了宏但完全没生效"，且不报任何错。
+# 最典型的用法是切 mock 模式，此时还要换个构建目录，否则会和真实构建的
+# .o 混在一起（改了宏但 make 认为 .o 是新的，不会重编）。
 ifdef ASAN
   BUILD_DIR := build_asan
-  CFLAGS    := -Wall -Wextra -O0 -g -I$(INC_DIR) -std=gnu11
+  CFLAGS    := -Wall -Wextra -O0 -g -I$(INC_DIR) -std=gnu11 $(EXTRA_CFLAGS)
   CFLAGS    += -fsanitize=address -fno-omit-frame-pointer
   LDFLAGS_LOCAL += -fsanitize=address
+else ifdef EXTRA_CFLAGS
+  BUILD_DIR := build_mock
+  CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -std=gnu11 $(EXTRA_CFLAGS)
 else
   BUILD_DIR := build
   CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -std=gnu11
@@ -97,17 +105,18 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 
 # ─── 清理 ───
 clean:
-	@echo "[CLEAN] 删除 build/ build_asan/ build_cross/"
-	@rm -rf build build_asan build_cross
+	@echo "[CLEAN] 删除 build/ build_asan/ build_mock/ build_cross/"
+	@rm -rf build build_asan build_mock build_cross
 	@echo "[CLEAN] 完成"
 
 # ─── I2C 设备检查（板端执行） ───
+# 注意：传感器挂在 /dev/i2c-0（设备树里叫 &i2c1，错位一个，别搞混）
 check:
 	@echo "=== I2C 总线检查 ==="
 	@ls -la /dev/i2c-* 2>/dev/null || echo "无 I2C 设备节点"
 	@echo ""
-	@echo "=== 扫描 I2C-1 总线上的设备 ==="
-	@i2cdetect -y 1 2>/dev/null || echo "请先安装 i2c-tools: sudo apt install i2c-tools"
+	@echo "=== 扫描 i2c-0 总线上的设备（应看到 0x14 / 0x57 / 0x68）==="
+	@i2cdetect -y 0 2>/dev/null || echo "请先安装 i2c-tools: sudo apt install i2c-tools"
 	@echo ""
 	@echo "=== 内核 I2C 驱动加载情况 ==="
 	@dmesg | grep -i i2c 2>/dev/null | tail -5 || echo "无法读取 dmesg（可能需要 sudo）"
@@ -115,9 +124,10 @@ check:
 # ─── 帮助 ───
 help:
 	@echo "可用目标："
-	@echo "  make          - 使用系统 gcc 编译（PC 端测试用）"
-	@echo "  make ASAN=1   - 使用 gcc + AddressSanitizer 编译（PC 端内存检查）"
-	@echo "  make cross    - 使用 arm-linux-gnueabihf-gcc 静态链接交叉编译"
-	@echo "  make check    - 在板端检查 I2C 设备（需要在板子上运行）"
-	@echo "  make clean    - 删除编译产物"
-	@echo "  make help     - 显示本信息"
+	@echo "  make                                - 使用系统 gcc 编译（PC 端测试用）"
+	@echo "  make EXTRA_CFLAGS=-DSENSOR_MOCK     - mock 模式，无硬件跑通全部线程（产物在 build_mock/）"
+	@echo "  make ASAN=1                         - gcc + AddressSanitizer（PC 端内存检查）"
+	@echo "  make cross                          - arm-linux-gnueabihf-gcc 静态链接交叉编译"
+	@echo "  make check                          - 在板端检查 I2C 设备（需要在板子上运行）"
+	@echo "  make clean                          - 删除编译产物"
+	@echo "  make help                           - 显示本信息"

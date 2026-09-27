@@ -1,0 +1,93 @@
+# ============================================================
+#  health_monitor systemd unit
+# ============================================================
+#
+# 安装：
+#   sudo cp scripts/health_monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now health_monitor
+#
+# 查看：
+#   systemctl status health_monitor
+#   journalctl -u health_monitor -f
+# ============================================================
+
+[Unit]
+Description=健康与环境监测终端 (i.MX6ULL + MPU6050/MAX30102)
+Documentation=file:///opt/health_monitor/README.md
+
+# MQTT 要连 broker / 华为云，等网络真正就绪再起，避免开机即一轮无谓重连。
+# 注意：Wants 是弱依赖，网络起不来也不会卡住启动（传感器采集不依赖网络）。
+After=network-online.target
+Wants=network-online.target
+
+# ── 防启动循环（关键）────────────────────────────────────────
+# 最坏的情形是"I2C 一上来就卡死 → 看门狗复位 → 开机 → 又卡死"，
+# 无限重启比卡着更糟：连登录进去查一眼的机会都没有。
+# 这里限制 300 秒内最多重启 5 次，超过就进入 failed 状态**停止拉起**，
+# 留一个可登录的 shell 给人工介入。
+# 注意这两行属于 [Unit] 段（systemd >= 229），放进 [Service] 会被忽略。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# ── 运行身份 ─────────────────────────────────────────────────
+# 必须 root：要开 /dev/i2c-0、gpiochip、以及 /dev/watchdog（默认 0600 root:root）。
+# 程序在拿不到 /dev/watchdog 时不会假装有保护，而是打一条醒目的
+# "本次运行没有看门狗保护"，并把巡检告警措辞降级为"仅告警"。
+# （若想降权运行，需为上述设备配 udev 规则 + 附加组，见 PROJECT_GUIDE。）
+User=root
+Group=root
+
+# ── 程序位置 ─────────────────────────────────────────────────
+# 按实际部署位置改这两行。推荐 /opt/health_monitor/：
+#   sudo mkdir -p /opt/health_monitor
+#   sudo cp build/health_monitor /opt/health_monitor/
+ExecStart=/opt/health_monitor/health_monitor
+WorkingDirectory=/opt/health_monitor
+
+# ── 状态目录（必须显式设置，否则统计会分家）──────────────────
+# 程序自身的解析顺序是：
+#   1. 环境变量 HEALTH_MONITOR_STATE_DIR
+#   2. sudo 场景下的 SUDO_USER 家目录
+#   3. $HOME
+# 而在 systemd 下**既没有 SUDO_USER，$HOME 又是 /root** —— 不设这一行，
+# 复位统计就会落到 /root/health_monitor，和你手动 sudo 跑出来的那份
+# 各记各的，两边都不完整。
+#
+# StateDirectory= 会由 systemd 创建 /var/lib/health_monitor 并设好属主，
+# 是系统服务的规范做法（不依赖任何用户家目录）。
+StateDirectory=health_monitor
+Environment=HEALTH_MONITOR_STATE_DIR=/var/lib/health_monitor
+#
+# 想沿用家目录下的 ~/demo（和手动运行看到的是同一份），
+# 改成下面两行、并删掉上面的 StateDirectory=：
+#   Environment=HEALTH_MONITOR_STATE_DIR=/home/<你的用户名>/demo
+
+# ── 输出分流 ─────────────────────────────────────────────────
+# display 线程每秒往 stdout 刷一屏 ANSI 转义序列（\033[H\033[J 整屏重绘），
+# 进 journal 只会把日志淹掉，所以丢弃 stdout。
+# 真正有价值的告警都走 stderr（[WATCHDOG] / [WARN] / [ERROR] 的 fprintf），
+# 保留进 journal。
+StandardOutput=null
+StandardError=journal
+
+# ── 重启策略 ─────────────────────────────────────────────────
+# always：正常退出、异常退出、被信号杀、看门狗复位后开机，都要拉起来。
+# 复位后重新拉起还兼一个作用：立刻补记上一次的退出原因
+# （看门狗的"上次是怎么退出的"是**下次启动时**才写日志的）。
+Restart=always
+RestartSec=5
+
+# ── 退出超时 ─────────────────────────────────────────────────
+# 收到 SIGTERM 后程序走协作式收尾：7 个线程各用带超时的 join 回收，
+# 最坏 3 + 2×6 = 15 秒，再留些余量。超时到了 systemd 会 SIGKILL。
+# 正常收尾的路径会走到 wd_stop()，把 last_clean=1 写进统计 —— 于是
+# systemctl stop 在账本上记的是一次"干净退出"；SIGKILL 则不会。
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

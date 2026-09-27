@@ -1,4 +1,9 @@
-# 健康与环境监测终端（health_monitor）
+# 健康与环境监测终端（health_monitor）— 项目指南
+
+> **状态（2026-09 结项）**：功能与稳定性均已完成并部署验证 —— systemd 自启动、
+> 看门狗复位、长跑无泄漏、I2C 总线不再瘫痪、断网自动重连全部通过；
+> 唯一遗留是 Ctrl+C 偶发失效，已由 systemd + 看门狗绕过，留待后续复现定位。
+> 面向 GitHub 访客的概览见 [`../README.md`](../README.md)。
 
 ## 项目概述
 
@@ -35,7 +40,7 @@
 | MQTT 上云 | libmosquitto，本地 broker / 华为云 IoTDA 双模式，TLS + HMAC-SHA256 |
 | 硬件看门狗兜底 | 5 路心跳监视，卡死则整板复位；复位原因统计 + 启动日志 |
 | I2C 总线恢复 | 设备树补 pinctrl GPIO 态 + `scl/sda-gpios`，仲裁丢失后驱动自动敲 SCL 唤醒 |
-| Mock 模式 | `make EXTRA_CFLAGS=-DSENSOR_MOCK`，无硬件也能跑全部线程与数据链路 |
+| Mock 模式 | `make EXTRA_CFLAGS=-DSENSOR_MOCK`，无硬件也能跑全部线程与数据链路（产物在 `build_mock/`） |
 
 ## 硬件需求
 
@@ -113,6 +118,7 @@ MAX30102 ─I2C(100Hz)─> thread_max30102 ─> g_latest_ppg ─┤
 
 ```
 health_monitor/
+├── README.md       # 项目门面：亮点、架构图、快速开始、部署
 ├── src/            # C 源码（10 个 .c）
 │   ├── main.c          # 主入口：初始化 + 线程编排 + 带超时 join
 │   ├── watchdog.c      # 硬件看门狗 + 复位计数 + 启动日志（734 行）
@@ -125,16 +131,20 @@ health_monitor/
 │   ├── display.c       # 终端渲染
 │   └── globals.c       # 全局变量 + 信号处理 + 日志缓冲
 ├── include/        # 头文件（11 个 .h）
-│   ├── config.h        # 全部可调参数集中地（含 MQTT 云配置、看门狗阈值）
-│   ├── watchdog.h      # 看门狗接口 + 被监视槽位定义
+│   ├── config.h                # 全部可调参数集中地（含 MQTT 云配置、看门狗阈值）
+│   ├── watchdog.h              # 看门狗接口 + 被监视槽位定义
+│   ├── cloud_secret.h.example  # 云平台三元组模板
 │   └── ...
 ├── client/
 │   ├── client.py       # TCP 客户端：接收 + 落盘 JSONL + 离线回放
 │   └── data/           # 落盘数据（.gitignore 忽略）
 ├── docs/
-│   ├── PROJECT_GUIDE.md      # 本文档：架构、编译、部署
+│   ├── PROJECT_GUIDE.md      # 本文档：架构、编译、部署、设计决策
 │   └── i2c-bus-recovery.md   # i2c-0 总线瘫痪复盘（含内核源码定位 + 面试 Q&A）
-├── scripts/        # I2C 检查脚本 + 调试工具
+├── scripts/        # I2C 检查脚本 + 长跑采样 + systemd unit
+│   ├── health_monitor.service  # systemd unit（部署时拷到 /etc/systemd/system/）
+│   ├── check_i2c.sh            # 板端 I2C 设备检查
+│   └── soak_watch.sh           # 长跑采样：RSS / fd 数 / 线程数
 ├── build/          # 编译产物
 └── Makefile        # 本地编译 / 交叉编译 / 检查
 ```
@@ -146,16 +156,32 @@ health_monitor/
 | 库 | 用途 | 开发包 |
 |----|------|--------|
 | pthread / libm | 多线程、数学 | 系统自带 |
-| libgpiod | GPIO 中断 | libgpiod-dev |
+| libgpiod | GPIO 中断 | libgpiod-dev，**必须是 1.x**（2.x 改了 API，见下） |
 | libmicrohttpd | HTTP 服务 | libmicrohttpd-dev |
 | libmosquitto | MQTT 客户端 | libmosquitto-dev |
 | libssl / libcrypto | TLS + HMAC-SHA256 | libssl-dev |
 
+> **libgpiod 版本坑**：`max30102.c` 里用的是 libgpiod **1.x** 的 line API
+> （`gpiod_chip_open` / `gpiod_chip_get_line` / `gpiod_line_request_both_edges_events`
+> / `gpiod_line_event_get_fd` / `gpiod_line_event_read`）。2.x 把这套整体重做了 ——
+> `gpiod_chip_open` 变成 `gpiod_chip_open_path`，line 变成不透明指针
+> `gpiod_line_request`，事件读取也换了对象类型。**升到 2.x 直接编不过**。
+>
+> 板端 Debian 10 自带 1.x，所以交叉编译不受影响；Ubuntu 24.04 / Debian 13 之后
+> 默认装的是 2.x，PC 端本地编译会失败。绕法：用 mock 模式（不走 GPIO），
+> 或从源码装 libgpiod 1.6.x。要彻底解决得写一层 v1/v2 兼容 shim。
+
 ### 本地编译（PC 端测试）
 
 ```bash
-make          # 使用系统 gcc，动态链接
+make                                # 使用系统 gcc，动态链接
+make EXTRA_CFLAGS=-DSENSOR_MOCK     # mock 模式（产物在 build_mock/，与 build/ 隔离）
+make ASAN=1                         # AddressSanitizer（产物在 build_asan/）
 ```
+
+三种模式输出到各自独立的目录。**这不是洁癖**：`EXTRA_CFLAGS` 变了但 `.c` 没改时，
+make 认为 `.o` 还是新的、不会重编，会出现"加了 `-DSENSOR_MOCK` 却依然去开硬件"的
+鬼故事。分目录之后切换模式无需手动 `clean`。
 
 ### 交叉编译（板端运行）
 
@@ -181,11 +207,39 @@ mosquitto -d
 sudo ./health_monitor
 
 # 无硬件时（PC 端验证线程/数据链路）：
-make EXTRA_CFLAGS=-DSENSOR_MOCK && ./build/health_monitor
+make EXTRA_CFLAGS=-DSENSOR_MOCK && ./build_mock/health_monitor
 ```
 
 统计文件默认落在 `~/demo/`（`watchdog_stats.conf` + `watchdog_boots.log`），
 可用 `HEALTH_MONITOR_STATE_DIR=/path` 覆盖。
+
+### systemd 托管（24h 无人值守）
+
+手动 `sudo ./health_monitor` 只适合调试。真正无人值守必须交给 systemd，
+否则看门狗复位后没人把程序拉起来，**也就没人来记账** —— 见下方"记账时机反直觉"。
+
+```bash
+sudo mkdir -p /opt/health_monitor
+sudo cp build/health_monitor /opt/health_monitor/
+
+sudo cp scripts/health_monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now health_monitor
+
+systemctl status health_monitor
+journalctl -u health_monitor -f
+```
+
+unit 文件（`scripts/health_monitor.service`）里几个不显然但必要的设置：
+
+| 设置 | 为什么 |
+|------|--------|
+| `Environment=HEALTH_MONITOR_STATE_DIR=...` | **必须显式设**。systemd 下没有 `SUDO_USER`、`$HOME` 是 `/root`，不设就会落到 `/root/...`，和手动 sudo 跑出来的统计**分家**。unit 里用 `StateDirectory=health_monitor` → `/var/lib/health_monitor`（系统服务的规范做法，不依赖家目录） |
+| `Restart=always` + `StartLimitBurst=5` / `StartLimitIntervalSec=300` | 前者保证复位后自动拉起；后者防**启动循环**（I2C 一上来就卡 → 复位 → 又卡）。300 秒内超过 5 次就进入 failed 停止拉起，留一个可登录的 shell |
+| `StandardOutput=null` | display 线程每秒刷一屏 ANSI 转义序列（整屏重绘），进 journal 只会把日志淹掉 |
+| `StandardError=journal` | 有价值的告警都走 stderr（`[WATCHDOG]` / `[WARN]` / `[ERROR]`），保留 |
+| `TimeoutStopSec=30` | 收到 SIGTERM 后协作式收尾最坏约 15 秒（3 + 2×6），留余量。走完收尾会调到 `wd_stop()` 写 `last_clean=1`，于是 `systemctl stop` 在账本上是**一次干净退出**；被 SIGKILL 则不是 |
+| `User=root` | 要开 `/dev/i2c-0`、gpiochip、`/dev/watchdog`（默认 `0600 root:root`） |
 
 ## 数据出口
 
@@ -217,12 +271,21 @@ MPU6050 六轴波形 + 心率/血氧数值。
 - **本地模式**（默认注释掉宏）：连接 `localhost:1883`，板端自建 mosquitto broker，无加密无认证。
 - **云端模式**（取消注释）：连接华为云 IoTDA，TLS 8883 端口 + HMAC-SHA256 鉴权。
 
-云端模式需在 `config.h` 填入华为云控制台的设备三元组（ProductKey / DeviceName / DeviceSecret）
-和设备接入地址。鉴权密码 = `HMAC-SHA256(key=UTC时间戳YYYYMMDDHH, data=DeviceSecret)`，每小时过期，
+云端模式的三元组（ProductKey / DeviceName / DeviceSecret）和设备接入地址
+放在**未纳入版本控制**的 `include/cloud_secret.h` 中，仓库里只提交模板：
+
+```bash
+cp include/cloud_secret.h.example include/cloud_secret.h
+# 填入华为云控制台 → 设备详情 → 设备信息 → 接入信息 中的真实值
+```
+
+`config.h` 在 `MQTT_CLOUD_MODE` 打开时 `#include "cloud_secret.h"`，
+而该文件已在 `.gitignore` 中排除。鉴权密码 =
+`HMAC-SHA256(key=UTC时间戳YYYYMMDDHH, data=DeviceSecret)`，每小时过期，
 板端时间须与 NTP 同步（偏差 <1 小时）。
 
-> **安全提醒**：DeviceSecret 属敏感凭证，不要提交到公开仓库。建议改为环境变量或单独的
-> 未跟踪配置文件。
+> **安全提醒**：DeviceSecret 属敏感凭证。改动 `.gitignore` 或重命名该文件前，
+> 先确认它不会被 `git add` 进去 —— 一旦进了历史，删文件也删不掉历史。
 
 ## 关键设计决策
 
@@ -289,15 +352,42 @@ MPU6050 六轴波形 + 心率/血氧数值。
 > 复位期间没有代码在跑。所以程序不自启动的话，复位后没人来记账，`cat` 看到的还是旧快照。
 > 24h 无人值守必须配 systemd `Restart=always`。
 
+### 结项验证结果
+
+补齐上面三层之后，本阶段（2026-09）的收尾验证：
+
+| 验证项 | 结果 |
+|--------|------|
+| systemd 自启动 + 崩溃自动拉起 | 通过，复位后自动接管并补记上一次退出原因 |
+| 硬件看门狗复位功能 | 通过。冻结整个进程 30 秒后板子复位，下次启动 `WDIOC_GETBOOTSTATUS` 正确带回 `WDIOF_CARDRESET`，日志打出"上次由看门狗超时复位"，`wd_resets` 0→1 |
+| 长期运行稳定性（RSS / fd / 线程数） | 通过，长时间运行未出现异常增长（用 `scripts/soak_watch.sh` 采样） |
+| I2C 总线不再瘫痪 | 通过，长时间运行未再复现仲裁丢失 |
+| 断网重连（MQTT） | 通过，`mosquitto_connect()` 阻塞数十秒后正常重连，未触发看门狗（验证了"MQTT 排除在心跳集合之外"这个决策是对的） |
+| Ctrl+C 优雅退出 | **未闭环**，见下方已知限制 |
+
 ## 已知限制与改进方向
 
-- **Ctrl+C 仍可能失效（未闭环）**：I2C 总线被拉死时进程可能卡住，且已排除"总线瘫痪"
-  是唯一原因（有一次 1 小时运行无瘫痪但 Ctrl+C 依然不灵）。**从未真正抓到卡住时的内核栈**，
-  这是最该补的一步：`ps -L -o lwp,stat,wchan:32 -p $PID` + `/proc/$PID/task/*/stack`。
-  头号嫌疑是 `i2c_transfer` 里拿 `adap->bus_lock` 的 `__mutex_lock`。
-- **未配 systemd 自启动**：当前需手动 `sudo ./health_monitor`。不配的话，看门狗复位后
-  无人记账，整套统计价值大打折扣。同时要防**启动循环**（I2C 一上来就卡 → 复位 → 又卡），
-  防法是应用层加闸：连续 N 次非正常退出就拒绝接管看门狗，留着 shell 可登录。
+- **Ctrl+C 偶发失效（未闭环，已暂避）**：个别情况下 `SIGINT` 无法让进程退出，
+  且已排除"总线瘫痪是唯一原因"（有一次 1 小时运行无瘫痪但 Ctrl+C 依然不灵）。
+  **从未真正抓到卡住时的内核栈**，这是最该补的一步：
+
+  ```bash
+  PID=$(pidof health_monitor)               # 别用 pgrep -f，会多匹配到 sudo 父进程
+  ps -L -o lwp,stat,wchan:32,comm -p $PID   # 看哪个线程是 D、卡在哪个内核函数
+  for t in /proc/$PID/task/*; do sudo cat $t/stack; done
+  echo w | sudo tee /proc/sysrq-trigger; sudo dmesg | tail -150
+  ```
+
+  头号嫌疑是 `i2c_transfer` 里拿 `adap->bus_lock` 的 `__mutex_lock`（其等待状态是
+  `TASK_UNINTERRUPTIBLE`，比总线本身更难恢复）；次要嫌疑是本版 4.19 的
+  `i2c_imx_xfer()` 每次传输都做一对 `pm_runtime_enable/disable`，`pm_runtime_disable()`
+  内部有 barrier。**当前由 systemd 托管 + 看门狗兜底绕过**：即使卡住也能在约 50 秒内
+  整板复位后自动拉起，不再需要人工拔电。留待后续复现时再抓栈定位。
+
+- **启动循环的防线在 systemd 层，应用层没有闸**：目前靠 unit 里
+  `StartLimitBurst=5` / `StartLimitIntervalSec=300` 兜底。更彻底的做法是应用层加闸：
+  连续 N 次非正常退出就**拒绝接管看门狗**（`wd_init()` 返回失败但程序继续跑），
+  把 shell 留给人工。两层的区别是——systemd 停了服务，应用层停了才有日志可查。
 - **MPU6050 连续异常后软复位尚无退避**：当前"连续 3 次异常 → 软复位"每 0.42 秒往死总线上
   再捅一刀。应改为指数退避 + 总线故障标志。**注意**：退避若导致线程停滞超过 20s 心跳阈值
   会把板子喂重启，两处必须一起设计。
@@ -309,4 +399,5 @@ MPU6050 六轴波形 + 心率/血氧数值。
 - **MPU6050 用 `usleep` 轮询**，实际周期 = 50ms + 读取耗时，长期有累积漂移。要精确采样率
   应改用 `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)` + 绝对时刻。
 - **JSON 拼装重复**：TCP / HTTP / MQTT 三处拼的 JSON 结构几乎相同，可抽成 `build_sensor_json()`。
-- **密钥硬编码**在 `config.h`，应外置。
+- ~~**密钥硬编码**在 `config.h`~~ **已解决**：三元组移入未纳入版本控制的 `include/cloud_secret.h`，
+  仓库只提交 `cloud_secret.h.example` 模板。更彻底的做法是走环境变量或 KMS。
