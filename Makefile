@@ -20,13 +20,15 @@ INC_DIR   := include
 # ─── 链接选项（先定义基础库，ASan 在后面按需追加） ───
 # 本地链接：动态链接（PC 端 glibc 版本一致，无此问题）
 # 需要 libmicrohttpd-dev / libmosquitto-dev / libssl-dev / libgpiod-dev 开发包
+# cJSON 已 vendor 到 third_party/cjson/，不再依赖系统 libcjson
 LDFLAGS_LOCAL := -lpthread -lm -lmicrohttpd -lmosquitto -lssl -lcrypto -lgpiod
 
 # 交叉链接：静态链接，避免板端 glibc 版本不匹配
 #   板端 Debian 10: glibc 2.28
 #   工具链(系统):  glibc 2.40+
 #   静态链接后二进制自包含 ~700KB，可接受
-#   注意：libmicrohttpd / libmosquitto / libssl / libcrypto / libgpiod 的 armhf .a 文件需提前准备
+#   注意：libmicrohttpd / libmosquitto / libssl / libcrypto / libgpiod
+#         的 armhf .a 文件需提前准备
 LDFLAGS_CROSS := -lpthread -lm -lmicrohttpd -lmosquitto -lssl -lcrypto -lgpiod -static
 
 # ─── 构建目录 + 编译选项（ASan 可选，仅 PC 本地编译） ───
@@ -42,20 +44,27 @@ LDFLAGS_CROSS := -lpthread -lm -lmicrohttpd -lmosquitto -lssl -lcrypto -lgpiod -
 # .o 混在一起（改了宏但 make 认为 .o 是新的，不会重编）。
 ifdef ASAN
   BUILD_DIR := build_asan
-  CFLAGS    := -Wall -Wextra -O0 -g -I$(INC_DIR) -std=gnu11 $(EXTRA_CFLAGS)
+  CFLAGS    := -Wall -Wextra -O0 -g -I$(INC_DIR) -Ithird_party/cjson -std=gnu11 $(EXTRA_CFLAGS)
   CFLAGS    += -fsanitize=address -fno-omit-frame-pointer
   LDFLAGS_LOCAL += -fsanitize=address
 else ifdef EXTRA_CFLAGS
   BUILD_DIR := build_mock
-  CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -std=gnu11 $(EXTRA_CFLAGS)
+  CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -Ithird_party/cjson -std=gnu11 $(EXTRA_CFLAGS)
 else
   BUILD_DIR := build
-  CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -std=gnu11
+  CFLAGS    := -Wall -Wextra -O2 -g -I$(INC_DIR) -Ithird_party/cjson -std=gnu11
 endif
 
-# ─── 源文件（自动收集 src/ 下所有 .c 文件） ───
-SRCS  := $(wildcard $(SRC_DIR)/*.c)
-OBJS  := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
+# 头文件依赖跟踪：生成 .d 文件，改了 config.h / *.h 也会触发重编。
+# 没有这一项时，make 只比较 .c 和 .o 的时间戳，改宏定义会静默不生效。
+CFLAGS += -MMD -MP
+
+# ─── 源文件（src/ 自动收集 + 第三方固定列表） ───
+SRCS       := $(wildcard $(SRC_DIR)/*.c)
+THIRD_SRCS := third_party/cjson/cJSON.c
+
+OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) \
+        $(patsubst third_party/cjson/%.c,$(BUILD_DIR)/%.o,$(THIRD_SRCS))
 
 # ─── 编译器选择 ───
 # 本地编译：直接使用系统 gcc
@@ -102,6 +111,15 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)
 	@echo "[CC] $< → $@"
 	@$(CC) -c $< -o $@ $(CFLAGS)
+
+# 第三方源码不跟随 src/ 的目录映射，单独一条规则
+$(BUILD_DIR)/cJSON.o: third_party/cjson/cJSON.c
+	@mkdir -p $(BUILD_DIR)
+	@echo "[CC] $< → $@"
+	@$(CC) -c $< -o $@ $(CFLAGS)
+
+# 头文件依赖（由 -MMD 生成，首次构建时文件不存在，用 -include 忽略）
+-include $(OBJS:.o=.d)
 
 # ─── 清理 ───
 clean:

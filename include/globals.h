@@ -37,11 +37,14 @@ extern pthread_mutex_t    g_mpu_lock;
 extern volatile sig_atomic_t g_running;
 extern volatile sig_atomic_t g_mqtt_connected;
 
+
 /* ═══ TCP 服务端共享数据 ═══ */
 extern int  clients[MAX_CLIENTS];
 extern int  client_count;
 extern char read_buf[BUF_SIZE];
 extern char write_buf[BUF_SIZE];
+
+extern char *build_snapshot_json(uint64_t timestamp_ms, const mpu6050_data_t *mpu, const PPG_Result_t *ppg);
 
 /* ═══ TCP 日志环形缓冲 ═══ */
 extern char tcp_log_buf[TCP_LOG_LINES][TCP_LOG_MAXLEN];

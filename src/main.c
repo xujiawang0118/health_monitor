@@ -5,11 +5,11 @@
  * 模块化后的 main.c 只负责：
  *   1. 传感器与中断初始化
  *   2. 看门狗接管（必须在创建工作线程之前）
- *   3. 7 个线程的创建与带超时回收
+ *   3. 8 个线程的创建与带超时回收
  *   4. 退出时的资源清理与看门狗归还
  *
- * 各功能线程（MAX30102 / MPU6050 / 显示 / TCP / HTTP / MQTT / 看门狗巡检）
- * 的实现分散在对应模块文件中，由本文件统一编排。
+ * 各功能线程（MAX30102 / MPU6050 / 显示 / TCP / HTTP / MQTT / 看门狗巡检 /
+ * 本地 IPC）的实现分散在对应模块文件中，由本文件统一编排。
  */
 
 #include "globals.h"    /* 必须在系统头文件之前——引入特性宏 */
@@ -31,7 +31,8 @@
 #include "http_server.h"
 #include "display.h"
 #include "watchdog.h"
-
+#include "local_server.h"
+#include "config.h"
 /*
  * TCP epoll_wait 超时时间（毫秒）。
  *
@@ -44,6 +45,54 @@
  */
 #define TCP_EPOLL_TIMEOUT_MS  500
 
+static local_server_t g_local_srv;
+static const char *local_sock_path(void)
+{
+    const char *p = getenv(LOCAL_SOCK_ENV);
+    return (p && p[0]) ? p : LOCAL_SOCK_PATH;
+}
+
+//本地ui
+static void *thread_local_server(void *arg)
+{
+    local_server_t *srv = arg;
+    uint64_t last_pub = 0;
+
+    while (g_running)
+    {
+        if (local_server_run_once(srv, 100) < 0)
+        {
+            tcp_log("[IPC] epoll 出错，本地界面线程退出");
+            break;
+        }
+
+        uint64_t now = get_sys_ms();          /* 只用于算间隔 */
+        if (now - last_pub < 500)
+            continue;
+        last_pub = now;
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);   /* t 字段用墙上时钟 */
+        uint64_t t_ms = (uint64_t)ts.tv_sec * 1000
+                        + (uint64_t)ts.tv_nsec / 1000000ULL;
+
+        pthread_mutex_lock(&g_mpu_lock);
+        mpu6050_data_t mpu = g_latest_mpu;
+        pthread_mutex_unlock(&g_mpu_lock);
+
+        pthread_mutex_lock(&g_ppg_lock);
+        PPG_Result_t ppg = g_latest_ppg;
+        pthread_mutex_unlock(&g_ppg_lock);
+
+        char *json = build_snapshot_json(t_ms, &mpu, &ppg);
+        if (json)
+        {
+            local_server_broadcast_snapshot(srv, json);
+            free(json);
+        }
+    }
+    return NULL;
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  *  MAX30102 传感器线程（GPIO 中断驱动）
@@ -514,25 +563,35 @@ static void *thread_tcp_server(void *arg)
             PPG_Result_t ppg = g_latest_ppg;
             pthread_mutex_unlock(&g_ppg_lock);
 
-            char json[512];
-            snprintf(json, sizeof(json),
-                "{\"t\":%llu,\"mpu\":{\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
-                "\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"temp\":%.1f},"
-                "\"ppg\":{\"hr\":%d,\"spo2\":%d,\"valid\":%d}}\n",
-                (unsigned long long)timestamp_ms,
-                mpu.accel_x_g, mpu.accel_y_g, mpu.accel_z_g,
-                mpu.gyro_x_dps, mpu.gyro_y_dps, mpu.gyro_z_dps, mpu.temp_c,
-                ppg.heart_rate, ppg.spo2, ppg.data_valid
-            );
+            // char json[512];
+            // snprintf(json, sizeof(json),
+            //     "{\"t\":%llu,\"mpu\":{\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
+            //     "\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"temp\":%.1f},"
+            //     "\"ppg\":{\"hr\":%d,\"spo2\":%d,\"valid\":%d}}\n",
+            //     (unsigned long long)timestamp_ms,
+            //     mpu.accel_x_g, mpu.accel_y_g, mpu.accel_z_g,
+            //     mpu.gyro_x_dps, mpu.gyro_y_dps, mpu.gyro_z_dps, mpu.temp_c,
+            //     ppg.heart_rate, ppg.spo2, ppg.data_valid
+            // );
 
-            size_t json_len = strlen(json);
+            // size_t json_len = strlen(json);
             
+            char *json = build_snapshot_json(timestamp_ms, &mpu, &ppg);
+            if (!json) {
+                /*
+                 * 只有内存不足才会返回 NULL，丢一帧即可。
+                 * 不能 return：那会直接退出整个 TCP 线程，连接和 epoll 全部丢失。
+                 * 走 continue 跳过本帧，不更新 last_publish，下轮自动重试。
+                 */
+                continue;
+            }
+            size_t json_len = strlen(json);
             //含半包处理
             for (int c = 0; c < client_count; c++) {
                 size_t total_sent = 0;
                 while(total_sent < json_len)
                 {
-                    ssize_t sent = send(clients[c], json + total_sent, json_len-total_sent, 0);
+                    ssize_t sent = send(clients[c], json + total_sent, json_len-total_sent, MSG_NOSIGNAL);
                     if (sent < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK)
                             break;   /* 缓冲满，放弃这帧，下帧再来（不能 continue 忙等） */
@@ -549,6 +608,7 @@ static void *thread_tcp_server(void *arg)
                 }
             
             }
+            free(json);
             last_publish = now;
         }
         
@@ -610,7 +670,7 @@ static int join_with_timeout(pthread_t tid, const char *name, long timeout_sec)
 /* ═══════════════════════════════════════════════════════════════════
  *  main — 总入口
  *
- *  初始化顺序：I2C → 传感器 → wd_init → 创建 7 个线程 → join → 清理
+ *  初始化顺序：I2C → 传感器 → wd_init → 创建 8 个线程 → join → 清理
  * ═══════════════════════════════════════════════════════════════════ */
 int main(int argc, char const *argv[])
 {
@@ -683,9 +743,34 @@ int main(int argc, char const *argv[])
      */
     wd_init();
 
-    /* 创建 7 个工作线程（6 个功能线程 + 1 个看门狗巡检线程） */
+    /* 创建 8 个线程（6 个功能线程 + 看门狗巡检 + 本地 IPC） */
     pthread_t max30102_thread, mpu6050_thread, display_thread;
     pthread_t tcp_thread, http_thread, mqtt_thread, wd_thread;
+    pthread_t ipc_thread;
+
+
+    int ipc_ok = 0;
+    int rc_ipc = -1;
+    const char *sock_path = local_sock_path();
+
+    if (local_server_init(&g_local_srv, sock_path) == 0)
+    {
+        ipc_ok = 1;
+        rc_ipc = pthread_create(&ipc_thread, NULL, thread_local_server, &g_local_srv);
+        if (rc_ipc != 0)
+        {
+            fprintf(stderr, "[ERROR] pthread_create(ipc): %s\n", strerror(rc_ipc));
+            local_server_destroy(&g_local_srv);
+            ipc_ok = 0;
+        }
+    }
+    else
+    {
+        /* 本地 UI 是辅助功能，起不来不影响采集、TCP、MQTT */
+        fprintf(stderr, "[WARN] 本地 IPC 未启用: %s"
+                        "（确认父目录存在且当前用户可写）\n",
+                sock_path);
+    }
 
     #ifdef SENSOR_MOCK
     int rc_max30102 = pthread_create(&max30102_thread, NULL, thread_max30102_mock, NULL);
@@ -695,6 +780,7 @@ int main(int argc, char const *argv[])
     int rc_max30102 = pthread_create(&max30102_thread, NULL, thread_max30102, &max30102_fd);
     int rc_mpu6050  = pthread_create(&mpu6050_thread,  NULL, thread_mpu6050,  &g_i2c_fd);
     #endif
+
     int rc_display  = pthread_create(&display_thread,   NULL, thread_display,  NULL);
     int rc_tcp      = pthread_create(&tcp_thread,       NULL, thread_tcp_server, NULL);
     int rc_http     = pthread_create(&http_thread,      NULL, thread_http_server, NULL);
@@ -739,7 +825,7 @@ int main(int argc, char const *argv[])
     /*
      * 只 join 创建成功的线程（失败的那个 pthread_t 未定义，不能 join）。
      *
-     * 六个线程全部走带超时的 join。不要觉得"网络/显示线程不碰 I2C，
+     * 所有线程全部走带超时的 join。不要觉得"网络/显示线程不碰 I2C，
      * 普通 join 就行" —— MQTT 线程会卡在阻塞的 mosquitto_connect()，
      * HTTP 线程会卡在没有超时的 MHD_stop_daemon()，一样能让进程退不出去。
      *
@@ -767,6 +853,21 @@ int main(int argc, char const *argv[])
         all_joined = 0;
     if (rc_mqtt     == 0 && join_with_timeout(mqtt_thread,     "mqtt",     2) != 0)
         all_joined = 0;
+
+    /*
+     * IPC 线程只操作自己那份 srv，和硬件线程没有共享资源。
+     * join 成功后再 destroy 是安全的；join 超时说明线程可能还卡在
+     * run_once 里，这时不能碰 srv —— 置 all_joined = 0，交给下面统一的
+     * _exit() 让内核回收。socket 文件留着，下次启动由 lstat + unlink 清掉。
+     */
+    if (rc_ipc == 0 && join_with_timeout(ipc_thread, "ipc", 2) != 0)
+    {
+        all_joined = 0;
+    }
+    else if (ipc_ok)
+    {
+        local_server_destroy(&g_local_srv);
+    }
 
     /*
      * 有线程没能在超时内退出：**不能**做资源清理。

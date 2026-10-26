@@ -1,0 +1,45 @@
+# ============================================================
+#  health-qt-ui.service — 板端 Qt 界面
+# ============================================================
+#
+# 安装：
+#   sudo cp health-qt-ui.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now health-qt-ui
+#
+# 注意：ExecStart 指向 run_on_board.sh，不是 health_ui 二进制。
+# linuxfb / tslib / 关闭 evdev 输入这些环境变量，以及触摸节点的
+# 动态发现，全在脚本里；直接起二进制会退回 xcb，报
+# "Could not connect to any X display"。
+# ============================================================
+
+[Unit]
+Description=Health Monitor Qt UI (linuxfb + tslib)
+After=health-monitor.service
+Wants=health-monitor.service
+
+# 开机时 udev 可能还没枚举完输入设备，脚本自己会等最多 20 秒。
+# 万一仍然超时退出，这里关掉启动频率限制，让 Restart=always
+# 一直重试，而不是几次之后就躺在 failed 状态不动。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=debian
+Group=debian
+
+# systemd 系统服务的 HOME 不保证是 /home/debian（脚本里用 $HOME/qtplugins），
+# 显式给一个，免得 set -u 判定未定义直接退出。
+Environment=HOME=/home/debian
+
+ExecStart=/home/debian/demo/10_25/health_monitor/health_ui/run_on_board.sh
+
+# 界面崩了、被 pkill、开机没起来，都要重新拉起；
+# 主动 systemctl stop 不会触发 Restart。
+Restart=always
+RestartSec=3
+
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

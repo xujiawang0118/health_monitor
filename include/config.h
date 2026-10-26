@@ -43,6 +43,14 @@
 #define TCP_LOG_LINES  6
 #define TCP_LOG_MAXLEN 128
 
+/* ─── 本地 Qt 界面 IPC ───
+ * 守护进程和 Qt 端必须用同一个路径；启动时可用环境变量覆盖。
+ * socket 文件的属主是守护进程用户，0660 意味着 Qt 进程要同用户或同组。
+ */
+#define LOCAL_SOCK_PATH  "/home/debian/demo/health_monitor.sock"
+#define LOCAL_SOCK_ENV   "HEALTH_MONITOR_SOCK"
+
+
 /* ============================================================
  *  MQTT 配置 — 本地 / 云端二选一
  * ============================================================

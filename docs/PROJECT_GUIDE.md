@@ -59,12 +59,12 @@ MAX30102: VCC→3.3V  GND→GND  SCL→I2C_SCL  SDA→I2C_SDA  (INT→GPIO)
 
 ## 软件架构
 
-### 线程模型（7 线程）
+### 线程模型（8 线程）
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                          main.c                                 │
-│  I2C 初始化 → 传感器初始化 → wd_init() → 创建 7 线程 → join → 清理 │
+│  I2C 初始化 → 传感器初始化 → wd_init() → 创建 8 线程 → join → 清理 │
 └───────┬──────────────────────────────────────────────────────────┘
         │
    ┌────┴───────────────────────────────────────────────────────┐
@@ -95,6 +95,7 @@ MAX30102: VCC→3.3V  GND→GND  SCL→I2C_SCL  SDA→I2C_SDA  (INT→GPIO)
 | TCP 服务端 | `thread_tcp_server` | epoll 边缘触发 + 非阻塞 accept/recv | epoll_wait 500ms 超时 |
 | HTTP 服务端 | `thread_http_server` | libmicrohttpd 内部轮询线程 | — |
 | MQTT 客户端 | `thread_mqtt` | libmosquitto + TLS + 华为云鉴权 | publish 500ms |
+| 本地 IPC | `thread_local_server` | AF_UNIX + epoll 水平触发 + NDJSON 分帧 | run_once 100ms / 推送 500ms |
 | 看门狗巡检 | `thread_watchdog` | 心跳停滞判定 + 喂狗 + 复位统计落盘 | 2000ms |
 
 > MQTT 线程**故意不纳入**心跳监视：`mosquitto_connect()` 阻塞几十秒是正常重连行为，
@@ -108,6 +109,7 @@ MAX30102 ─I2C(100Hz)─> thread_max30102 ─> g_latest_ppg ─┤
                                                         ├─> display（终端）
                                                         ├─> TCP :6666 ──> client.py（落盘/回放）
                                                         ├─> HTTP :8080 ─> 浏览器 Chart.js
+                                                        ├─> 本地 IPC ──> 板端 Qt 界面（AF_UNIX）
                                                         └─> MQTT ──> broker / 华为云 IoTDA
 ```
 
@@ -119,7 +121,7 @@ MAX30102 ─I2C(100Hz)─> thread_max30102 ─> g_latest_ppg ─┤
 ```
 health_monitor/
 ├── README.md       # 项目门面：亮点、架构图、快速开始、部署
-├── src/            # C 源码（10 个 .c）
+├── src/            # C 源码（11 个 .c）
 │   ├── main.c          # 主入口：初始化 + 线程编排 + 带超时 join
 │   ├── watchdog.c      # 硬件看门狗 + 复位计数 + 启动日志（734 行）
 │   ├── max30102.c      # MAX30102 驱动 + PPG 算法
@@ -128,13 +130,17 @@ health_monitor/
 │   ├── tcp_server.c    # TCP 工具函数（非阻塞/客户端管理）
 │   ├── http_server.c   # libmicrohttpd + 内嵌 HTML
 │   ├── mqtt_client.c   # libmosquitto 客户端（双模式）
+│   ├── local_server.c  # 本地 AF_UNIX 服务端（Qt 界面通道）
 │   ├── display.c       # 终端渲染
 │   └── globals.c       # 全局变量 + 信号处理 + 日志缓冲
-├── include/        # 头文件（11 个 .h）
-│   ├── config.h                # 全部可调参数集中地（含 MQTT 云配置、看门狗阈值）
+├── include/        # 头文件（12 个 .h）
+│   ├── config.h                # 全部可调参数集中地（含 MQTT 云配置、看门狗阈值、IPC 路径）
 │   ├── watchdog.h              # 看门狗接口 + 被监视槽位定义
+│   ├── local_server.h          # 本地 IPC 服务端接口
 │   ├── cloud_secret.h.example  # 云平台三元组模板
 │   └── ...
+├── third_party/
+│   └── cjson/                  # vendored cJSON 1.7.19，随源码一起交叉编译
 ├── client/
 │   ├── client.py       # TCP 客户端：接收 + 落盘 JSONL + 离线回放
 │   └── data/           # 落盘数据（.gitignore 忽略）
@@ -160,6 +166,7 @@ health_monitor/
 | libmicrohttpd | HTTP 服务 | libmicrohttpd-dev |
 | libmosquitto | MQTT 客户端 | libmosquitto-dev |
 | libssl / libcrypto | TLS + HMAC-SHA256 | libssl-dev |
+| cJSON 1.7.19 | JSON 序列化（快照 / 命令） | 已 vendor 到 `third_party/cjson/`，无需安装 |
 
 > **libgpiod 版本坑**：`max30102.c` 里用的是 libgpiod **1.x** 的 line API
 > （`gpiod_chip_open` / `gpiod_chip_get_line` / `gpiod_line_request_both_edges_events`

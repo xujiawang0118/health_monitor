@@ -172,13 +172,13 @@ poll();
  *    可以直接返回响应。对于 POST 请求，MHD 会多次调用，
  *    每次传入一段请求体数据，直到消费完毕。
  * ═══════════════════════════════════════════════════════════════════ */
-static mhd_result_t http_handler(void *cls,
+static int http_handler(void *cls,
                         struct MHD_Connection *conn,
                         const char *url,
                         const char *method,
                         const char *version,
                         const char *upload_data,
-                        size_t *upload_data_size,
+                        unsigned int *upload_data_size,
                         void **con_cls)
 {
     (void)cls;

@@ -66,6 +66,18 @@ Environment=HEALTH_MONITOR_STATE_DIR=/var/lib/health_monitor
 # 改成下面两行、并删掉上面的 StateDirectory=：
 #   Environment=HEALTH_MONITOR_STATE_DIR=/home/<你的用户名>/demo
 
+# ── DNS 超时收紧 ─────────────────────────────────────────────
+# 板子用 ConnMan 管网络，resolv.conf 是一个本地 DNS 代理（127.0.0.1:53）。
+# 开机后 Wi-Fi 关联 + DHCP 完成之前，这个代理没有上游，会**静默丢包**而不是
+# 立刻返回错误。glibc 默认 5 秒超时 × 2 次重试 × 2 个 nameserver ≈ 20 秒，
+# 期间 mosquitto_connect() 一直阻塞在 getaddrinfo 里：
+#   1. MQTT 重试变成 20 秒一轮，Wi-Fi 好了也迟迟接不上；
+#   2. 这段时间收到 SIGTERM，线程回收要干等它返回（Ctrl+C 卡死的老问题之一）。
+#
+# RES_OPTIONS 覆盖 resolv.conf 里的 options 行，把它压到 2 秒 × 1 次 ≈ 4 秒
+# 上限，既够容忍 Wi-Fi 上的正常 DNS 延迟，又不会在断网时长时间阻塞。
+Environment=RES_OPTIONS=timeout:2 attempts:1
+
 # ── 输出分流 ─────────────────────────────────────────────────
 # display 线程每秒往 stdout 刷一屏 ANSI 转义序列（\033[H\033[J 整屏重绘），
 # 进 journal 只会把日志淹掉，所以丢弃 stdout。

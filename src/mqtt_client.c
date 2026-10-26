@@ -363,7 +363,42 @@ void *thread_mqtt(void *arg)
     while (g_running) {
 
         if (mosq != NULL) {
-            mosquitto_loop(mosq, /* timeout_ms */ 100, /* max_packets */ 1);
+            /*
+             * mosquitto_loop() 的返回值必须看。
+             *
+             * libmosquitto 并不保证所有错误都回调 on_mqtt_disconnect：
+             * TLS 层被中间设备打断、协议解析失败、socket 被内核以 RST 干掉、
+             * 或者 loop 内部 poll 出错，这些情况 loop 直接返回错误码，
+             * 而 g_mqtt_connected 仍然停在 1。
+             *
+             * 后果是连锁的：
+             *   - 发布分支看到 g_mqtt_connected == 1，照常 publish。qos 0 且
+             *     底层 socket 已死时 publish 返回 MOSQ_ERR_NO_CONN，消息被
+             *     静默丢弃，界面上什么都看不到；
+             *   - 重连分支的前提是 !g_mqtt_connected，于是永远不会触发。
+             * 最终表现就是"程序活得好好的，云端一直离线，重启一下又好了"——
+             * 正好对上现在的症状。
+             *
+             * 处理分两种：
+             *   MOSQ_ERR_NO_CONN —— 还没连上或已经断了，只清标志位，
+             *     交给下面每 5 秒一次的重连逻辑，不在这里销毁重建（否则
+             *     100ms 一轮循环就重建一个客户端，等于死循环刷日志）；
+             *   其他错误 —— 客户端状态已经不可信了，直接丢掉，并且把
+             *     last_reconnect 归零，让下一轮立刻重建，不白等 5 秒。
+             */
+            int lrc = mosquitto_loop(mosq, /* timeout_ms */ 100, /* max_packets */ 1);
+            if (lrc != MOSQ_ERR_SUCCESS) {
+                if (lrc == MOSQ_ERR_NO_CONN) {
+                    g_mqtt_connected = 0;
+                } else {
+                    tcp_log("[MQTT] loop 出错 (%d: %s)，丢弃客户端并立即重连",
+                            lrc, mosquitto_strerror(lrc));
+                    g_mqtt_connected = 0;
+                    mosquitto_destroy(mosq);
+                    mosq = NULL;
+                    last_reconnect = 0;      /* now - 0 必然 >= 5000，下一轮就重连 */
+                }
+            }
         } else {
             /* mosq 为空（如断网导致重建失败）时也要休眠 100ms，避免忙等占满 CPU */
             usleep(100 * 1000);
@@ -412,9 +447,22 @@ void *thread_mqtt(void *arg)
                 ppg.heart_rate, ppg.spo2, ppg.data_valid
             );
 
-            mosquitto_publish(mosq, NULL, MQTT_TOPIC_SENSORS,
-                              len, json, /* qos */ 0, /* retain */ false);
-
+            /*
+             * publish 的返回值同样要看。
+             *
+             * qos 0 是"发出去就不管"，但在 socket 已经死掉的情况下
+             * libmosquitto 连字节都写不出去，会直接返回 MOSQ_ERR_NO_CONN，
+             * 消息就这么没了 —— 调用方不检查的话，云端少数据没有任何痕迹。
+             * 发布失败和 loop 失败是同一个病根，处理方式也一样：清标志位，
+             * 让下一轮循环走重连分支。
+             */
+            int prc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_SENSORS,
+                                        len, json, /* qos */ 0, /* retain */ false);
+            if (prc != MOSQ_ERR_SUCCESS) {
+                tcp_log("[MQTT] 发布失败 (%d: %s)，标记断线等待重连",
+                        prc, mosquitto_strerror(prc));
+                g_mqtt_connected = 0;
+            }
 #ifdef MQTT_CLOUD_MODE
             /*
              * 华为云 IoTDA 属性上报。
@@ -425,6 +473,7 @@ void *thread_mqtt(void *arg)
              *
              * 注意 hr/spo2 是整数，ax 是浮点（保留 2 位小数）。
              */
+            else
             {
                 char cloud_json[256];
                 int cloud_len = snprintf(cloud_json, sizeof(cloud_json),
@@ -440,9 +489,14 @@ void *thread_mqtt(void *arg)
                     ppg.heart_rate, ppg.spo2,
                     mpu.accel_x_g
                 );
-                mosquitto_publish(mosq, NULL, MQTT_TOPIC_PROPERTIES,
-                                  cloud_len, cloud_json,
-                                  /* qos */ 0, /* retain */ false);
+                int crc = mosquitto_publish(mosq, NULL, MQTT_TOPIC_PROPERTIES,
+                                            cloud_len, cloud_json,
+                                            /* qos */ 0, /* retain */ false);
+                if (crc != MOSQ_ERR_SUCCESS) {
+                    tcp_log("[MQTT] 云端属性上报失败 (%d: %s)，标记断线等待重连",
+                            crc, mosquitto_strerror(crc));
+                    g_mqtt_connected = 0;
+                }
             }
 #endif
 

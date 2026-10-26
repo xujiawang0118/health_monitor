@@ -1,0 +1,22 @@
+# qmake 生成的构建文件
+Makefile
+Makefile.*
+*.pro.user
+*.pro.user.*
+
+# uic / moc / rcc 生成物（每次构建重新生成，不入库）
+ui_*.h
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+
+# 编译中间产物
+*.o
+*.obj
+build-*/
+debug/
+release/
+
+# 可执行文件
+health_ui
+health_ui.exe

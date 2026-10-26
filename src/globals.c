@@ -11,6 +11,10 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include "cJSON.h"      /* third_party/cjson，跟着源码一起交叉编译 */
+#include <pthread.h>
+#include <stdint.h>
+#include <math.h>
 
 /* ═══ 全局句柄 ═══ */
 int g_i2c_fd = -1;
@@ -26,6 +30,7 @@ pthread_mutex_t    g_mpu_lock       = PTHREAD_MUTEX_INITIALIZER;
 /* ═══ 运行状态标志位 ═══ */
 volatile sig_atomic_t g_running         = 1;
 volatile sig_atomic_t g_mqtt_connected  = 0;
+
 
 /*
  * 已收到的退出信号次数，用于分级退出（详见 signal_handler 的注释）。
@@ -58,6 +63,68 @@ uint64_t get_sys_ms(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
+
+
+/*
+ * cJSON 本身没有全局可变状态（唯一的是 cJSON_InitHooks 设置的分配器钩子），
+ * 每次调用各自创建/销毁自己的 cJSON 对象，所以 TCP 线程和 IPC 线程
+ * 并发调用 build_snapshot_json() 是安全的。
+ * 前提：启动后不要再调 cJSON_InitHooks()。
+ *
+ * cJSON 的 AddNumberToObject 只接受 double。float 转 double 会把二进制误差
+ * 原样带出来：0.02f → 0.019999999552965164，帧又长又难看。
+ * 这里按字段精度先取整，让输出回到 "0.02" 这种正常形式。
+ */
+static double round_digits(double v, int digits)
+{
+    double scale = pow(10.0, digits);
+    return round(v * scale) / scale;
+}
+
+char *build_snapshot_json(uint64_t timestamp_ms, const mpu6050_data_t *mpu, const PPG_Result_t *ppg){
+    if (!mpu || !ppg) return NULL;
+
+    cJSON *root = cJSON_CreateObject();
+    if(!root)   {return NULL;}
+
+    cJSON_AddNumberToObject(root, "t", (double)timestamp_ms);
+
+    cJSON *obj_mpu = cJSON_CreateObject();
+    /* 与旧版 snprintf 格式保持一致：加速度/角速度 %.2f，温度 %.1f */
+    cJSON_AddNumberToObject(obj_mpu, "ax", round_digits(mpu->accel_x_g, 2));
+    cJSON_AddNumberToObject(obj_mpu, "ay", round_digits(mpu->accel_y_g, 2));
+    cJSON_AddNumberToObject(obj_mpu, "az", round_digits(mpu->accel_z_g, 2));
+    cJSON_AddNumberToObject(obj_mpu, "gx", round_digits(mpu->gyro_x_dps, 2));
+    cJSON_AddNumberToObject(obj_mpu, "gy", round_digits(mpu->gyro_y_dps, 2));
+    cJSON_AddNumberToObject(obj_mpu, "gz", round_digits(mpu->gyro_z_dps, 2));
+    cJSON_AddNumberToObject(obj_mpu, "temp", round_digits(mpu->temp_c, 1));
+    cJSON_AddItemToObject(root, "mpu", obj_mpu);
+
+    cJSON *obj_ppg = cJSON_CreateObject();
+    cJSON_AddNumberToObject(obj_ppg, "hr", ppg->heart_rate);
+    cJSON_AddNumberToObject(obj_ppg, "spo2", ppg->spo2);
+    cJSON_AddNumberToObject(obj_ppg, "valid", ppg->data_valid);
+    cJSON_AddItemToObject(root, "ppg", obj_ppg);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json_str) {return NULL;}
+
+    int len = strlen(json_str);
+    char *frame = malloc(len + 2);
+    if (!frame) {
+        free(json_str);
+        return NULL;
+    }
+    memcpy(frame, json_str, len);
+    frame[len] = '\n';
+    frame[len + 1] = '\0';
+    free(json_str);
+    return frame;
+}
+
+
 
 /* ─── TCP 日志：线程安全地写入环形缓冲 ─── */
 /*
@@ -108,6 +175,22 @@ void tcp_log(const char *fmt, ...)
     len = strlen(msg);
     while (len > 0 && (msg[len-1] == '\n' || msg[len-1] == '\r'))
         msg[--len] = '\0';
+
+    /*
+     * 关键消息镜像一份到 stderr。
+     *
+     * 环形缓冲只服务于屏幕显示：display 线程读它、再整屏打印到 stdout。
+     * 服务化之后 unit 里是 StandardOutput=null（stdout 全是 ANSI 重绘），
+     * 于是 MQTT 连接失败、断线、发布失败这类信息在 journal 里一根毛都看不到，
+     * 排查云端问题等于闭着眼睛。
+     *
+     * 只放行三类前缀，避免每秒两帧的显示内容把 journal 灌满。
+     * stderr 由 fprintf 一次写出，是完整的 UTF-8 行；而 stdout 那边是
+     * 分块写的，中文字符被切断后 journald 判成非法 UTF-8，只显示
+     * "[31B blob data]" —— 这也是为什么 journalctl 里看不到正文。
+     */
+    if (strstr(msg, "[MQTT]") || strstr(msg, "[WARN]") || strstr(msg, "[ERROR]"))
+        fprintf(stderr, "%s\n", msg);
 
     pthread_mutex_lock(&tcp_log_lock);
     strncpy(tcp_log_buf[tcp_log_head], msg, TCP_LOG_MAXLEN - 1);

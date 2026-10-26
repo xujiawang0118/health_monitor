@@ -13,3 +13,4 @@
 void *thread_display(void *arg);
 
 #endif /* DISPLAY_H */
+
